@@ -1,0 +1,14 @@
+[package]
+name = "precise_rate_limiter"
+version = "0.1.0"
+edition = "2021"
+authors = ["wushilin"]
+description = "A high-performance, precise rate limiter using tokio channels and atomic operations"
+license = "Apache-2.0"
+repository = "https://github.com/wushilin/precise_rate_limiter.rs"
+keywords = ["rate-limiter", "rate-limit", "throttle", "tokio", "async"]
+categories = ["asynchronous", "concurrency"]
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
