@@ -86,18 +86,26 @@ async fn refill_task(
     loop {
         interval_timer.tick().await;
         
-        let current = tokens.load(Ordering::Acquire);
-        if current >= capacity {
-            // Already at max limit, skip this refill
-            continue;
-        }
+        // Try to atomically add tokens if we're not at capacity
+        let added = tokens.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                if current >= capacity {
+                    None // Already at capacity, don't update
+                } else {
+                    let to_add = (capacity - current).min(refill_amount);
+                    if to_add > 0 {
+                        Some(current + to_add)
+                    } else {
+                        None
+                    }
+                }
+            }
+        ).is_ok();
         
-        // Calculate how much we can safely add (won't exceed capacity)
-        let to_add = (capacity - current).min(refill_amount);
-        if to_add > 0 {
-            // Since there's only one refiller, fetch_add is safe
-            tokens.fetch_add(to_add, Ordering::AcqRel);
-            // Notify acquire task that tokens might be available now
+        if added {
+            // Successfully added tokens, notify acquire task
             tokens_available.notify_one();
         }
     }
@@ -112,24 +120,28 @@ async fn acquire_task(
     while let Some(request) = receiver.recv().await {
         // Wait until we can fulfill this request
         loop {
-            let current = tokens.load(Ordering::Acquire);
-            if current >= request.required {
-                // Since there's only one acquire task, fetch_sub is safe
-                let old = tokens.fetch_sub(request.required, Ordering::AcqRel);
-                // Verify we had enough (should always be true since we checked, but be safe)
-                if old >= request.required {
-                    // Ignore send errors (receiver might be dropped if caller cancelled)
-                    let _ = request.notify.send(());
-                    break;
+            // Try to atomically subtract tokens if we have enough
+            let success = tokens.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| {
+                    if current >= request.required {
+                        Some(current - request.required)
+                    } else {
+                        None // Not enough tokens, don't update
+                    }
                 }
-                println!("The impossible happened: we didn't have enough tokens");
-                // If we didn't have enough (shouldn't happen, but handle it), add it back and retry
-                tokens.fetch_add(request.required, Ordering::AcqRel);
+            ).is_ok();
+            
+            if success {
+                // Successfully acquired tokens atomically
+                let _ = request.notify.send(());
+                break;
             } else {
                 // Not enough tokens, wait for refill task to notify us
                 // Use timeout as fail-safe in case notifications are missed
                 let _ = timeout(Duration::from_millis(10), tokens_available.notified()).await;
-                // Continue loop to check tokens again (either notified or timed out)
+                // Continue loop to try again (either notified or timed out)
             }
         }
     }
