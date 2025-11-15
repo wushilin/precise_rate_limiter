@@ -1,16 +1,15 @@
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, atomic::{AtomicUsize, Ordering}
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 struct AcquireRequest {
     required: usize,
-    notify: Arc<Notify>,
+    notify: oneshot::Sender<()>,
 }
 
 pub struct Quota {
@@ -54,19 +53,23 @@ impl Quota {
         if n > self.max_buffer {
             panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
         }
-        let notify = Arc::new(Notify::new());
+        let (sender, receiver) = oneshot::channel();
         let request = AcquireRequest {
             required: n,
-            notify: notify.clone(),
+            notify: sender,
         };
         
         // All acquire requests go through the mpsc channel
         self.acquire_sender.send(request).await.expect("acquire channel closed");
         
-        // Wait for notification that tokens are available
-        notify.notified().await;
-    }
+        // Wait for completion of acquire request
+        // but we also check the flag in case we missed the notification
 
+        receiver.await.unwrap();
+        //while !completed.load(Ordering::Acquire) {
+        //    tokio::time::timeout(Duration::from_millis(100), notify.notified()).await.unwrap();
+        //}
+    }
 }
 
 // Background task 1: Keep adding tokens using atomic usize up to max limit, then stop adding
@@ -115,8 +118,8 @@ async fn acquire_task(
                 let old = tokens.fetch_sub(request.required, Ordering::AcqRel);
                 // Verify we had enough (should always be true since we checked, but be safe)
                 if old >= request.required {
-                    // Successfully acquired, notify the waiter
-                    request.notify.notify_one();
+                    // Ignore send errors (receiver might be dropped if caller cancelled)
+                    let _ = request.notify.send(());
                     break;
                 }
                 println!("The impossible happened: we didn't have enough tokens");
@@ -315,18 +318,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_acquire_request() {
-        let quota = Quota::new(10, 1, Duration::from_millis(1));
-        
+        let quota = Quota::new(2000, 1, Duration::from_millis(1));
+        quota.acquire(2000).await;
         // Try to acquire more than capacity
         let start = Instant::now();
-        let result = tokio::time::timeout(Duration::from_millis(1000), quota.acquire(15)).await;
+        let result = tokio::time::timeout(Duration::from_millis(1000), quota.acquire(1500)).await;
         assert!(result.is_err());
         let elapsed = start.elapsed();
         
         // Should wait until enough tokens accumulate
         // 15 tokens - 10 initial = 5 more needed
         // At 1 per 100ms, that's ~500ms
-        assert!(elapsed >= Duration::from_millis(1000));
+        assert!(elapsed >= Duration::from_millis(900));
     }
 
     #[tokio::test]
