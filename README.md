@@ -22,6 +22,18 @@ Therefore, your quota granularity, at most can go 400,000 per second at 1 acquis
 
 If this is not fast enough, you can acquire multiple of X tokens and buffer locally for immediate reuse. For example, if you acquired 5000 tokens at once, then consume one by one locally until counter goes to zero, then you can call Quota.acquire(5000) again. In this case, your ops per second can be 5000*400,000 = 20 billion ops. The global quota of ops per second is still honored.
 
+### Notes about atomicity
+The token refills and deduction are using atomic usize and should be accurate, atomic.
+the refill is using time ticker and missed ticker events (unlikely) are bursted up.
+
+the refill is very reliable. 
+
+## Notes about initial token bucket.
+The bucket is initially full. The initial number of token is always the max token.
+If you consume quota too slowly, you will always operate at full speed.
+
+If you consume quota too fast, you will burn out the token bucket soon, and you will be
+subjected to the quota refill rate.
 
 ## Warning
 The quota refill will stop once the buffered token reaches the max_token.
