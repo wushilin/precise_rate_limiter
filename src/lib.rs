@@ -1,3 +1,30 @@
+//! A high-performance, precise rate limiter using tokio channels and atomic operations.
+//!
+//! This crate provides a token bucket rate limiter that:
+//! - Uses a single background task for token refilling at fixed intervals
+//! - Uses a single background task for processing acquire requests in FIFO order
+//! - Supports flexible acquire and refill amounts (up to `max_buffer`)
+//! - Provides fair, FIFO queueing for acquire requests
+//!
+//! # Example
+//!
+//! ```no_run
+//! use precise_rate_limiter::Quota;
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Create a quota: max 1000 tokens, refill 100 tokens every 100ms
+//!     let quota = Quota::new(1000, 100, Duration::from_millis(100));
+//!
+//!     // Acquire 50 tokens (will wait if not enough available)
+//!     quota.acquire(50).await;
+//!
+//!     // Acquire more tokens
+//!     quota.acquire(200).await;
+//! }
+//! ```
+
 use std::{
     sync::{
         Arc, atomic::{AtomicUsize, Ordering}
@@ -12,6 +39,24 @@ struct AcquireRequest {
     notify: oneshot::Sender<()>,
 }
 
+/// A rate limiter that uses a token bucket algorithm with automatic refilling.
+///
+/// The quota starts with `max_buffer` tokens available. Tokens are automatically
+/// refilled at fixed intervals by a background task. Acquire requests are processed
+/// in FIFO order by a separate background task, ensuring fairness.
+///
+/// The quota is designed to be shared across many threads/tasks. Clone the `Arc<Quota>`
+/// to share it between tasks.
+///
+/// # Performance
+///
+/// The acquire operation can handle roughly 400,000 operations per second when not
+/// blocked on token availability. For higher throughput, acquire multiple tokens at
+/// once and buffer them locally.
+///
+/// # Panics
+///
+/// The `acquire` method will panic if `n > max_buffer`.
 pub struct Quota {
     tokens: Arc<AtomicUsize>,
     max_buffer: usize,
@@ -19,6 +64,38 @@ pub struct Quota {
 }
 
 impl Quota {
+    /// Creates a new quota with the specified parameters.
+    ///
+    /// The quota starts with `max_buffer` tokens available. A background task
+    /// automatically refills `refill_amount` tokens every `refill_interval`,
+    /// up to the `max_buffer` limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_buffer` - Maximum number of tokens that can be stored. The quota
+    ///   starts with this many tokens available. Acquire requests cannot exceed
+    ///   this value.
+    /// * `refill_amount` - Number of tokens to add per refill interval. Can be
+    ///   larger than `max_buffer` (will be capped to available space).
+    /// * `refill_interval` - Time interval between refills. The first refill happens
+    ///   after the first interval (not immediately).
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<Quota>` that can be cloned and shared across tasks.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use precise_rate_limiter::Quota;
+    /// use std::time::Duration;
+    ///
+    /// let quota = Quota::new(
+    ///     1000,                        // max_buffer: 1000 tokens
+    ///     100,                         // refill_amount: 100 tokens
+    ///     Duration::from_millis(100),  // refill_interval: every 100ms
+    /// );
+    /// ```
     pub fn new(max_buffer: usize, refill_amount: usize, refill_interval: Duration) -> Arc<Self> {
         let (acquire_sender, acquire_receiver) = mpsc::channel(500);
         
@@ -49,6 +126,36 @@ impl Quota {
         quota
     }
 
+    /// Acquires `n` tokens from the quota.
+    ///
+    /// This method will wait until enough tokens are available. The request is
+    /// queued in FIFO order, ensuring fair processing of concurrent acquire requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Number of tokens to acquire. Must be `<= max_buffer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n > max_buffer`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use precise_rate_limiter::Quota;
+    /// use std::time::Duration;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let quota = Quota::new(100, 10, Duration::from_millis(100));
+    ///
+    ///     // Acquire 50 tokens (will wait if not enough available)
+    ///     quota.acquire(50).await;
+    ///
+    ///     // Acquire more tokens
+    ///     quota.acquire(30).await;
+    /// }
+    /// ```
     pub async fn acquire(self: &Arc<Self>, n: usize) {
         if n > self.max_buffer {
             panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
@@ -72,7 +179,10 @@ impl Quota {
     }
 }
 
-// Background task 1: Keep adding tokens using atomic usize up to max limit, then stop adding
+/// Background task that automatically refills tokens at fixed intervals.
+///
+/// Uses `fetch_update` to atomically check and add tokens, ensuring we never
+/// exceed the capacity limit. Notifies the acquire task when tokens are added.
 async fn refill_task(
     tokens: Arc<AtomicUsize>,
     capacity: usize,
@@ -111,7 +221,11 @@ async fn refill_task(
     }
 }
 
-// Background task 2: Receive from mpsc channel and wait until it can be fulfilled and notify the waiter
+/// Background task that processes acquire requests in FIFO order.
+///
+/// Receives acquire requests from the mpsc channel and waits until enough tokens
+/// are available. Uses `fetch_update` to atomically check and subtract tokens.
+/// Includes a 10ms timeout as a fail-safe for missed notifications.
 async fn acquire_task(
     tokens: Arc<AtomicUsize>,
     mut receiver: mpsc::Receiver<AcquireRequest>,
