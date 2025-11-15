@@ -51,6 +51,9 @@ impl Quota {
     }
 
     pub async fn acquire(self: &Arc<Self>, n: usize) {
+        if n > self.max_buffer {
+            panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
+        }
         let notify = Arc::new(Notify::new());
         let request = AcquireRequest {
             required: n,
@@ -324,5 +327,128 @@ mod tests {
         // 15 tokens - 10 initial = 5 more needed
         // At 1 per 100ms, that's ~500ms
         assert!(elapsed >= Duration::from_millis(1000));
+    }
+
+    #[tokio::test]
+    async fn test_throughput_100m_per_100ms() {
+        // Refill: 100 million tokens per 100ms
+        // Max buffer: 10 billion tokens
+        let quota = Quota::new(
+            10_000_000_000,              // max_buffer: 10 billion
+            100_000_000,                  // refill_amount: 100 million
+            Duration::from_millis(100),   // refill_interval: 100ms
+        );
+        
+        let start = Instant::now();
+        let acquired_count = Arc::new(AtomicU64::new(0));
+        
+        let threads = 5;
+        println!("Starting throughput test: {} threads acquiring tokens for 10 seconds...", threads);
+        
+        // Spawn 500 tasks, each acquiring 1 token in a loop
+        let mut handles = vec![];
+        for _ in 0..threads {
+            let quota = quota.clone();
+            let count = acquired_count.clone();
+            handles.push(tokio::spawn(async move {
+                let mut local_count = 0u64;
+                while start.elapsed() < Duration::from_secs(10) {
+                    quota.acquire(1).await;
+                    local_count += 1;
+                }
+                count.fetch_add(local_count, AtomicOrdering::Relaxed);
+                local_count
+            }));
+        }
+        
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        let total_acquired = acquired_count.load(AtomicOrdering::Relaxed);
+        let elapsed = start.elapsed();
+        
+        println!("\nThroughput Test Results:");
+        println!("Total tokens acquired by all {} threads: {}", threads, total_acquired);
+        println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
+        println!("Tokens per second: {:.2}", total_acquired as f64 / elapsed.as_secs_f64());
+        println!("Expected refill rate: 1,000,000,000 tokens/second (100M per 100ms)");
+        println!("\nTest completed successfully!");
+    }
+
+    #[tokio::test]
+    async fn test_mpsc_throughput() {
+        use tokio::sync::mpsc as tokio_mpsc;
+        
+        let num_senders = 500;
+        let (sender, mut receiver) = tokio_mpsc::channel(500);
+        
+        let start = Instant::now();
+        let sent_count = Arc::new(AtomicU64::new(0));
+        let received_count = Arc::new(AtomicU64::new(0));
+        
+        println!("Starting mpsc throughput test: {} sender threads, 1 receiver thread, running for 10 seconds...", num_senders);
+        
+        // Spawn sender tasks
+        let mut sender_handles = vec![];
+        for _ in 0..num_senders {
+            let sender = sender.clone();
+            let count = sent_count.clone();
+            sender_handles.push(tokio::spawn(async move {
+                let mut local_sent = 0u64;
+                while start.elapsed() < Duration::from_secs(10) {
+                    if sender.send(local_sent).await.is_ok() {
+                        local_sent += 1;
+                    } else {
+                        break; // Channel closed
+                    }
+                }
+                count.fetch_add(local_sent, AtomicOrdering::Relaxed);
+                local_sent
+            }));
+        }
+        
+        // Spawn receiver task
+        let receiver_count = received_count.clone();
+        let receiver_handle = tokio::spawn(async move {
+            let mut local_received = 0u64;
+            while start.elapsed() < Duration::from_secs(10) {
+                match receiver.recv().await {
+                    Some(_) => {
+                        local_received += 1;
+                    }
+                    None => {
+                        break; // Channel closed
+                    }
+                }
+            }
+            receiver_count.fetch_add(local_received, AtomicOrdering::Relaxed);
+            local_received
+        });
+        
+        // Wait for all senders to complete
+        for handle in sender_handles {
+            handle.await.unwrap();
+        }
+        
+        // Close the sender to signal receiver to stop
+        drop(sender);
+        
+        // Wait for receiver to complete
+        receiver_handle.await.unwrap();
+        
+        let total_sent = sent_count.load(AtomicOrdering::Relaxed);
+        let total_received = received_count.load(AtomicOrdering::Relaxed);
+        let elapsed = start.elapsed();
+        
+        println!("\nMPSC Throughput Test Results:");
+        println!("Number of sender threads: {}", num_senders);
+        println!("Total messages sent: {}", total_sent);
+        println!("Total messages received: {}", total_received);
+        println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
+        println!("Sends per second: {:.2}", total_sent as f64 / elapsed.as_secs_f64());
+        println!("Receives per second: {:.2}", total_received as f64 / elapsed.as_secs_f64());
+        println!("\nTest completed successfully!");
     }
 }
