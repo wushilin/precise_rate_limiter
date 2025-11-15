@@ -2,6 +2,33 @@
 
 A high-performance, precise rate limiter for Rust using tokio channels and atomic operations.
 
+The Quota::new gives you an Arc<Quota>, so you can easily share this among many threads. You can clone it, send it, no issues.
+
+## Use cases
+
+1. Shared global quota (e.g. built a VPN server but want to limit global bandwidth). You can consume millions of bytes or bits at one go and refresh millions of bits or bytes at one go.
+2. API quota across a single server between many threads.
+3. Any other high quota refill rate and high acquisitation situation, sometimes acquisition is weighted (depend on actual consumption of tokens, e.g. bytes sent)
+
+
+Performance:
+Since quota is always fair and FIFO, it uses mpsc channel internally. The channel has 500 buffer. When you call quota.acquire, you send a wait request to the queue and wait for wake up.
+When queue is full, you are blocked, of course. When queue is not full, you queue request is waiting to be processed and you entered Notify.await state.
+
+The thread determines the head of queue can be waken up will wake up each caller in order.
+
+Based on benchmark, the await operation (assuming not blocked on quota refreshment), can handle roughly 400,000 operations per second. 
+Therefore, your quota granularity, at most can go 400,000 per second at 1 acquisition.
+
+If this is not fast enough, you can acquire multiple of X tokens and buffer locally for immediate reuse. For example, if you acquired 5000 tokens at once, then consume one by one locally until counter goes to zero, then you can call Quota.acquire(5000) again. In this case, your ops per second can be 5000*400,000 = 20 billion ops. The global quota of ops per second is still honored.
+
+
+## Warning
+The quota refill will stop once the buffered token reaches the max_token.
+
+If you try to acquire max_token + N where N is positive, your code will panic.
+
+
 ## Features
 
 - **Event-driven**: Uses tokio channels and notifications for efficient waiting
