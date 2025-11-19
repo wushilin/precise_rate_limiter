@@ -1,6 +1,6 @@
 [package]
 name = "precise_rate_limiter"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 authors = ["wushilin"]
 description = "A high-performance, precise rate limiter using tokio channels and atomic operations"
