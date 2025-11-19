@@ -3,8 +3,8 @@
 A high-performance, precise rate limiter for Rust using tokio channels and atomic operations.
 
 This crate provides two implementations:
-- **`Quota`**: A fair, FIFO rate limiter with guaranteed ordering
 - **`FastQuota`**: A high-performance variant with 10x better throughput in low-contention scenarios
+- **`Quota`**: A fair, FIFO rate limiter with guaranteed ordering
 
 Both `Quota::new()` and `FastQuota::new()` return `Arc<Self>`, so you can easily share them among many threads. You can clone it, send it, no issues.
 
@@ -25,6 +25,94 @@ Based on benchmark, the await operation (assuming not blocked on quota refreshme
 Therefore, your quota granularity, at most can go 400,000 per second at 1 acquisition.
 
 If this is not fast enough, you can acquire multiple of X tokens and buffer locally for immediate reuse. For example, if you acquired 5000 tokens at once, then consume one by one locally until counter goes to zero, then you can call Quota.acquire(5000) again. In this case, your ops per second can be 5000*400,000 = 20 billion ops. The global quota of ops per second is still honored.
+
+## FastQuota: High-Performance Variant
+
+`FastQuota` is an optimized variant of `Quota` that provides significantly better performance in low-contention scenarios while maintaining reasonable fairness guarantees.
+
+### Two-Path Design
+
+`FastQuota` uses a dual-path architecture:
+
+- **Fast Path**: Direct token acquisition using atomic operations when there's no contention
+  - Achieves approximately **4 million operations per second** (10x faster than `Quota`)
+  - No channel overhead, minimal latency
+  - Used when no requests are queued and tokens are available
+
+- **Slow Path**: FIFO-queued processing when there is contention
+  - Falls back to the same fair queueing mechanism as `Quota`
+  - Ensures requests are processed in order when tokens are scarce
+  - Uses a write lock to prevent fast path from bypassing queued requests
+
+### When to Use FastQuota
+
+Use `FastQuota` when:
+- You have **low contention** (most requests succeed immediately)
+- You need **maximum throughput** for high-frequency operations
+- You can tolerate **slight fairness trade-offs** in edge cases
+- Performance is more critical than perfect FIFO ordering
+
+Use `Quota` when:
+- You need **guaranteed perfect fairness** (strict FIFO)
+- Contention is expected to be high
+- Fairness is more important than peak performance
+
+### Performance Comparison
+
+| Metric | Quota | FastQuota |
+|--------|-------|-----------|
+| Low contention throughput, mostly no waits | ~400K ops/sec | ~4M ops/sec |
+| High contention throughput, everyone waits | ~400K ops/sec | ~400K ops/sec |
+| Fairness | Perfect FIFO | Mostly FIFO (with edge cases) |
+| Latency (low contention) | Higher (channel overhead) | Lower (direct atomic ops) |
+
+### Fairness Trade-offs
+
+`FastQuota` prioritizes performance over perfect fairness:
+
+- **Queued requests are processed in FIFO order** - Once requests enter the slow path, they are handled fairly
+- **Write lock prevents bypassing** - When processing queued requests, the fast path is blocked
+- **Edge case**: In rare situations, a fast-path acquire may succeed even when a request is being queued (but not yet processed)
+
+For most practical use cases, `FastQuota` provides excellent performance with reasonable fairness guarantees.
+
+### FastQuota Example
+
+```rust
+use precise_rate_limiter::FastQuota;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    // Create a fast quota with the same parameters as Quota
+    let quota = FastQuota::new(
+        1000,                        // max_buffer: 1000 tokens
+        100,                         // refill_amount: 100 tokens
+        Duration::from_millis(100),  // refill_interval: every 100ms
+    );
+    
+    // Fast path: acquires immediately if tokens available
+    quota.acquire(50).await;
+    
+    // Automatically falls back to slow path if needed
+    quota.acquire(200).await;
+}
+```
+
+### Implementation Details
+
+The fast path works by:
+1. Attempting to acquire a read lock (non-blocking)
+2. If successful, atomically checking and subtracting tokens
+3. Returning immediately if tokens are available
+
+The slow path:
+1. Sends request to a channel (same as `Quota`)
+2. Background task acquires write lock (blocks fast path)
+3. Processes requests in FIFO order
+4. Releases write lock when queue is empty
+
+This design ensures that when there's no contention, operations are extremely fast, while still maintaining fairness when contention occurs.
 
 ### Notes about atomicity
 The token refills and deduction are using atomic usize and should be accurate, atomic.
@@ -146,93 +234,6 @@ The rate limiter uses a **completely fair FIFO (First-In-First-Out) queueing mec
 
 This guarantees that if multiple tasks request tokens simultaneously, they will be served in the order they called `acquire()`, preventing any task from being starved or receiving preferential treatment.
 
-## FastQuota: High-Performance Variant
-
-`FastQuota` is an optimized variant of `Quota` that provides significantly better performance in low-contention scenarios while maintaining reasonable fairness guarantees.
-
-### Two-Path Design
-
-`FastQuota` uses a dual-path architecture:
-
-- **Fast Path**: Direct token acquisition using atomic operations when there's no contention
-  - Achieves approximately **4 million operations per second** (10x faster than `Quota`)
-  - No channel overhead, minimal latency
-  - Used when no requests are queued and tokens are available
-
-- **Slow Path**: FIFO-queued processing when there is contention
-  - Falls back to the same fair queueing mechanism as `Quota`
-  - Ensures requests are processed in order when tokens are scarce
-  - Uses a write lock to prevent fast path from bypassing queued requests
-
-### When to Use FastQuota
-
-Use `FastQuota` when:
-- You have **low contention** (most requests succeed immediately)
-- You need **maximum throughput** for high-frequency operations
-- You can tolerate **slight fairness trade-offs** in edge cases
-- Performance is more critical than perfect FIFO ordering
-
-Use `Quota` when:
-- You need **guaranteed perfect fairness** (strict FIFO)
-- Contention is expected to be high
-- Fairness is more important than peak performance
-
-### Performance Comparison
-
-| Metric | Quota | FastQuota |
-|--------|-------|-----------|
-| Low contention throughput, mostly no waits | ~400K ops/sec | ~4M ops/sec |
-| High contention throughput, everyone waits | ~400K ops/sec | ~400K ops/sec |
-| Fairness | Perfect FIFO | Mostly FIFO (with edge cases) |
-| Latency (low contention) | Higher (channel overhead) | Lower (direct atomic ops) |
-
-### Fairness Trade-offs
-
-`FastQuota` prioritizes performance over perfect fairness:
-
-- **Queued requests are processed in FIFO order** - Once requests enter the slow path, they are handled fairly
-- **Write lock prevents bypassing** - When processing queued requests, the fast path is blocked
-- **Edge case**: In rare situations, a fast-path acquire may succeed even when a request is being queued (but not yet processed)
-
-For most practical use cases, `FastQuota` provides excellent performance with reasonable fairness guarantees.
-
-### FastQuota Example
-
-```rust
-use precise_rate_limiter::FastQuota;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() {
-    // Create a fast quota with the same parameters as Quota
-    let quota = FastQuota::new(
-        1000,                        // max_buffer: 1000 tokens
-        100,                         // refill_amount: 100 tokens
-        Duration::from_millis(100),  // refill_interval: every 100ms
-    );
-    
-    // Fast path: acquires immediately if tokens available
-    quota.acquire(50).await;
-    
-    // Automatically falls back to slow path if needed
-    quota.acquire(200).await;
-}
-```
-
-### Implementation Details
-
-The fast path works by:
-1. Attempting to acquire a read lock (non-blocking)
-2. If successful, atomically checking and subtracting tokens
-3. Returning immediately if tokens are available
-
-The slow path:
-1. Sends request to a channel (same as `Quota`)
-2. Background task acquires write lock (blocks fast path)
-3. Processes requests in FIFO order
-4. Releases write lock when queue is empty
-
-This design ensures that when there's no contention, operations are extremely fast, while still maintaining fairness when contention occurs.
 
 ## License
 
