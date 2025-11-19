@@ -1044,4 +1044,245 @@ mod tests {
         println!("Receives per second: {:.2}", total_received as f64 / elapsed.as_secs_f64());
         println!("\nTest completed successfully!");
     }
+
+    #[tokio::test]
+    async fn test_contention_transition_quota() {
+        // Quota: 100 tokens max, refill 10 tokens every 100ms
+        let quota = Quota::new(100, 10, Duration::from_millis(100));
+        
+        let start = Instant::now();
+        let acquire_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        
+        println!("\n=== Quota: Contention Transition Test ===");
+        println!("Starting with low contention, gradually increasing to high contention");
+        
+        // Spawn 50 tasks, each making multiple acquires with decreasing sleep intervals
+        let num_tasks = 50;
+        let acquires_per_task = 10;
+        let mut handles = vec![];
+        
+        for task_id in 0..num_tasks {
+            let quota = quota.clone();
+            let times = acquire_times.clone();
+            handles.push(tokio::spawn(async move {
+                // Start with long sleep (low contention), gradually decrease
+                for acquire_num in 0..acquires_per_task {
+                    // Sleep duration: starts at 200ms, decreases to 0ms
+                    let sleep_ms = 200 - (acquire_num * 20).min(200);
+                    if sleep_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+                    }
+                    
+                    let acquire_start = Instant::now();
+                    quota.acquire(1).await;
+                    let wait_time = acquire_start.elapsed();
+                    let total_elapsed = start.elapsed();
+                    
+                    times.lock().unwrap().push((task_id, acquire_num, total_elapsed, wait_time));
+                }
+            }));
+        }
+        
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        let total_time = start.elapsed();
+        let times = acquire_times.lock().unwrap();
+        let total_acquires = times.len();
+        
+        // Calculate statistics
+        let mut wait_times: Vec<Duration> = times.iter().map(|(_, _, _, wait)| *wait).collect();
+        wait_times.sort();
+        
+        let total_wait_secs: f64 = wait_times.iter().map(|d| d.as_secs_f64()).sum();
+        let avg_wait_secs = total_wait_secs / wait_times.len() as f64;
+        let avg_wait = Duration::from_secs_f64(avg_wait_secs);
+        let median_wait = wait_times[wait_times.len() / 2];
+        let min_wait = wait_times[0];
+        let max_wait = wait_times[wait_times.len() - 1];
+        
+        // Calculate effective rate
+        let effective_rate = total_acquires as f64 / total_time.as_secs_f64();
+        
+        // Calculate fairness: variance in wait times
+        let wait_variance: f64 = wait_times.iter()
+            .map(|w| {
+                let diff = w.as_secs_f64() - avg_wait.as_secs_f64();
+                diff * diff
+            })
+            .sum::<f64>() / wait_times.len() as f64;
+        let wait_stddev = wait_variance.sqrt();
+        
+        // Calculate order preservation: check if tasks that started earlier generally acquired earlier
+        // Group by task and calculate average acquire time per task
+        let mut task_avg_times: Vec<(usize, Duration)> = Vec::new();
+        for task_id in 0..num_tasks {
+            let task_acquires: Vec<Duration> = times.iter()
+                .filter(|(t, _, _, _)| *t == task_id)
+                .map(|(_, _, elapsed, _)| *elapsed)
+                .collect();
+            if !task_acquires.is_empty() {
+                let total_secs: f64 = task_acquires.iter().map(|d| d.as_secs_f64()).sum();
+                let avg_secs = total_secs / task_acquires.len() as f64;
+                let avg = Duration::from_secs_f64(avg_secs);
+                task_avg_times.push((task_id, avg));
+            }
+        }
+        task_avg_times.sort_by_key(|(_, time)| *time);
+        
+        // Calculate fairness score: how evenly distributed wait times are
+        // Lower variance = more fair
+        let fairness_score = 1.0 / (1.0 + wait_stddev * 1000.0); // Normalize to 0-1 range
+        
+        println!("\n=== Quota Statistics ===");
+        println!("Total acquires: {}", total_acquires);
+        println!("Total time: {:.2}s", total_time.as_secs_f64());
+        println!("Effective rate: {:.2} acquires/sec", effective_rate);
+        println!("Expected max rate: ~100 acquires/sec (10 tokens per 100ms)");
+        println!("\nWait Time Statistics:");
+        println!("  Average wait: {:.2}ms", avg_wait.as_secs_f64() * 1000.0);
+        println!("  Median wait: {:.2}ms", median_wait.as_secs_f64() * 1000.0);
+        println!("  Min wait: {:.2}ms", min_wait.as_secs_f64() * 1000.0);
+        println!("  Max wait: {:.2}ms", max_wait.as_secs_f64() * 1000.0);
+        println!("  Std deviation: {:.2}ms", wait_stddev * 1000.0);
+        println!("\nFairness Metrics:");
+        println!("  Fairness score: {:.4} (1.0 = perfect fairness)", fairness_score);
+        println!("  Wait time variance: {:.4}", wait_variance);
+        
+        // Verify all acquires completed
+        assert_eq!(total_acquires, num_tasks * acquires_per_task);
+        
+        // Effective rate should be close to refill rate (with some overhead)
+        assert!(effective_rate > 50.0, "Effective rate too low: {:.2}", effective_rate);
+        assert!(effective_rate < 150.0, "Effective rate too high: {:.2}", effective_rate);
+        
+        println!("\n=== Quota Test Passed ===\n");
+    }
+
+    #[tokio::test]
+    async fn test_contention_transition_fastquota() {
+        // FastQuota: 100 tokens max, refill 10 tokens every 100ms
+        let quota = FastQuota::new(100, 10, Duration::from_millis(100));
+        
+        let start = Instant::now();
+        let acquire_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        
+        println!("\n=== FastQuota: Contention Transition Test ===");
+        println!("Starting with low contention, gradually increasing to high contention");
+        
+        // Spawn 50 tasks, each making multiple acquires with decreasing sleep intervals
+        let num_tasks = 50;
+        let acquires_per_task = 10;
+        let mut handles = vec![];
+        
+        for task_id in 0..num_tasks {
+            let quota = quota.clone();
+            let times = acquire_times.clone();
+            handles.push(tokio::spawn(async move {
+                // Start with long sleep (low contention), gradually decrease
+                for acquire_num in 0..acquires_per_task {
+                    // Sleep duration: starts at 200ms, decreases to 0ms
+                    let sleep_ms = 200 - (acquire_num * 20).min(200);
+                    if sleep_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+                    }
+                    
+                    let acquire_start = Instant::now();
+                    quota.acquire(1).await;
+                    let wait_time = acquire_start.elapsed();
+                    let total_elapsed = start.elapsed();
+                    
+                    times.lock().unwrap().push((task_id, acquire_num, total_elapsed, wait_time));
+                }
+            }));
+        }
+        
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+        let total_time = start.elapsed();
+        let times = acquire_times.lock().unwrap();
+        let total_acquires = times.len();
+        
+        // Calculate statistics
+        let mut wait_times: Vec<Duration> = times.iter().map(|(_, _, _, wait)| *wait).collect();
+        wait_times.sort();
+        
+        let total_wait_secs: f64 = wait_times.iter().map(|d| d.as_secs_f64()).sum();
+        let avg_wait_secs = total_wait_secs / wait_times.len() as f64;
+        let avg_wait = Duration::from_secs_f64(avg_wait_secs);
+        let median_wait = wait_times[wait_times.len() / 2];
+        let min_wait = wait_times[0];
+        let max_wait = wait_times[wait_times.len() - 1];
+        
+        // Calculate effective rate
+        let effective_rate = total_acquires as f64 / total_time.as_secs_f64();
+        
+        // Calculate fairness: variance in wait times
+        let wait_variance: f64 = wait_times.iter()
+            .map(|w| {
+                let diff = w.as_secs_f64() - avg_wait.as_secs_f64();
+                diff * diff
+            })
+            .sum::<f64>() / wait_times.len() as f64;
+        let wait_stddev = wait_variance.sqrt();
+        
+        // Calculate order preservation: check if tasks that started earlier generally acquired earlier
+        // Group by task and calculate average acquire time per task
+        let mut task_avg_times: Vec<(usize, Duration)> = Vec::new();
+        for task_id in 0..num_tasks {
+            let task_acquires: Vec<Duration> = times.iter()
+                .filter(|(t, _, _, _)| *t == task_id)
+                .map(|(_, _, elapsed, _)| *elapsed)
+                .collect();
+            if !task_acquires.is_empty() {
+                let total_secs: f64 = task_acquires.iter().map(|d| d.as_secs_f64()).sum();
+                let avg_secs = total_secs / task_acquires.len() as f64;
+                let avg = Duration::from_secs_f64(avg_secs);
+                task_avg_times.push((task_id, avg));
+            }
+        }
+        task_avg_times.sort_by_key(|(_, time)| *time);
+        
+        // Calculate fairness score: how evenly distributed wait times are
+        // Lower variance = more fair
+        let fairness_score = 1.0 / (1.0 + wait_stddev * 1000.0); // Normalize to 0-1 range
+        
+        // Count fast path vs slow path (approximate: very short waits likely fast path)
+        let fast_path_count = wait_times.iter().filter(|w| w.as_millis() < 1).count();
+        let slow_path_count = total_acquires - fast_path_count;
+        
+        println!("\n=== FastQuota Statistics ===");
+        println!("Total acquires: {}", total_acquires);
+        println!("Total time: {:.2}s", total_time.as_secs_f64());
+        println!("Effective rate: {:.2} acquires/sec", effective_rate);
+        println!("Expected max rate: ~100 acquires/sec (10 tokens per 100ms)");
+        println!("\nPath Usage (estimated):");
+        println!("  Fast path (wait < 1ms): {} ({:.1}%)", fast_path_count, 
+                 fast_path_count as f64 / total_acquires as f64 * 100.0);
+        println!("  Slow path (wait >= 1ms): {} ({:.1}%)", slow_path_count,
+                 slow_path_count as f64 / total_acquires as f64 * 100.0);
+        println!("\nWait Time Statistics:");
+        println!("  Average wait: {:.2}ms", avg_wait.as_secs_f64() * 1000.0);
+        println!("  Median wait: {:.2}ms", median_wait.as_secs_f64() * 1000.0);
+        println!("  Min wait: {:.2}ms", min_wait.as_secs_f64() * 1000.0);
+        println!("  Max wait: {:.2}ms", max_wait.as_secs_f64() * 1000.0);
+        println!("  Std deviation: {:.2}ms", wait_stddev * 1000.0);
+        println!("\nFairness Metrics:");
+        println!("  Fairness score: {:.4} (1.0 = perfect fairness)", fairness_score);
+        println!("  Wait time variance: {:.4}", wait_variance);
+        
+        // Verify all acquires completed
+        assert_eq!(total_acquires, num_tasks * acquires_per_task);
+        
+        // Effective rate should be close to refill rate (with some overhead)
+        assert!(effective_rate > 50.0, "Effective rate too low: {:.2}", effective_rate);
+        assert!(effective_rate < 150.0, "Effective rate too high: {:.2}", effective_rate);
+        
+        println!("\n=== FastQuota Test Passed ===\n");
+    }
 }
