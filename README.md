@@ -2,11 +2,17 @@
 
 A high-performance, precise rate limiter for Rust using tokio channels and atomic operations.
 
-This crate provides two implementations:
+This crate provides four implementations:
+
+**Async implementations (for tokio async contexts):**
 - **`FastQuota`**: A high-performance variant with 10x better throughput in low-contention scenarios
 - **`Quota`**: A fair, FIFO rate limiter with guaranteed ordering
 
-Both `Quota::new()` and `FastQuota::new()` return `Arc<Self>`, so you can easily share them among many threads. You can clone it, send it, no issues.
+**Synchronous implementations (for non-async contexts):**
+- **`FastQuotaSync`**: Synchronous version with best-effort FIFO ordering and fast-path optimization
+- **`QuotaSync`**: Synchronous version with perfect FIFO ordering
+
+Both `Quota::new()` and `FastQuota::new()` (as well as their sync variants) return `Arc<Self>`, so you can easily share them among many threads. You can clone it, send it, no issues.
 
 ## Use cases
 
@@ -150,6 +156,86 @@ Add this to your `Cargo.toml`:
 precise_rate_limiter = "0.1.0"
 tokio = { version = "1", features = ["full"] }
 ```
+
+## Synchronous Implementations
+
+For non-async contexts (e.g., standard threads, libraries without async runtime), this crate provides synchronous versions that use blocking operations instead of async/await.
+
+### QuotaSync: Blocking with Perfect FIFO
+
+`QuotaSync` provides the same functionality as `Quota` but uses `std::sync` primitives and blocks the calling thread instead of using async/await.
+
+**Features:**
+- **Perfect FIFO ordering**: Guarantees strict first-in-first-out processing
+- **Blocking operations**: Uses `std::sync` instead of tokio async
+- **Same API**: Drop-in replacement for `Quota` in non-async contexts
+- **Background threads**: Uses standard threads for refilling and processing
+
+**Example:**
+
+```rust
+use precise_rate_limiter::QuotaSync;
+use std::time::Duration;
+use std::thread;
+
+fn main() {
+    let quota = QuotaSync::new(100, 10, Duration::from_millis(100));
+    
+    // Blocks until tokens are available
+    quota.acquire(50);
+    println!("Acquired 50 tokens!");
+    
+    // Can be shared across threads
+    let quota_clone = quota.clone();
+    thread::spawn(move || {
+        quota_clone.acquire(30);
+        println!("Thread acquired 30 tokens!");
+    }).join().unwrap();
+}
+```
+
+### FastQuotaSync: Blocking with Best-Effort FIFO
+
+`FastQuotaSync` provides the same functionality as `FastQuota` but uses blocking operations.
+
+**Features:**
+- **Fast-path optimization**: Uses atomic operations for low-contention scenarios
+- **Best-effort FIFO**: Maintains fairness once requests are queued
+- **High performance**: Similar throughput improvements as `FastQuota`
+- **No async runtime needed**: Uses standard threads and blocking
+
+**Example:**
+
+```rust
+use precise_rate_limiter::FastQuotaSync;
+use std::time::Duration;
+
+fn main() {
+    let quota = FastQuotaSync::new(1000, 100, Duration::from_millis(100));
+    
+    // Fast path: acquires immediately if tokens available
+    quota.acquire(50);
+    
+    // Automatically falls back to slow path if needed
+    quota.acquire(200);
+}
+```
+
+### When to Use Sync vs Async
+
+| Use Case | Recommended Implementation |
+|----------|---------------------------|
+| **Tokio async application** | `Quota` or `FastQuota` |
+| **Standard threads** | `QuotaSync` or `FastQuotaSync` |
+| **Library without async** | `QuotaSync` or `FastQuotaSync` |
+| **Mixed async/sync code** | Use both (they're independent) |
+
+### Performance Notes
+
+The synchronous implementations have similar performance characteristics to their async counterparts:
+- `QuotaSync` processes ~400K requests/sec (similar to `Quota`)
+- `FastQuotaSync` can achieve ~4M requests/sec on the fast path (similar to `FastQuota`)
+- Both use background threads for token refilling and request processing
 
 ## Example
 

@@ -27,11 +27,13 @@
 
 use std::{
     sync::{
-        Arc, atomic::{AtomicUsize, Ordering}
+        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
     },
+    thread,
     time::Duration,
 };
-use tokio::sync::{Notify, RwLock, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 struct AcquireRequest {
@@ -110,7 +112,7 @@ impl FastQuota {
     /// ```
     pub fn new(max_buffer: usize, refill_amount: usize, refill_interval: Duration) -> Arc<Self> {
         let (acquire_sender, acquire_receiver) = mpsc::channel(500);
-        
+
         let quota = Arc::new(Self {
             tokens: Arc::new(AtomicUsize::new(max_buffer)),
             max_buffer,
@@ -120,7 +122,7 @@ impl FastQuota {
 
         let tokens_available = Arc::new(Notify::new());
         let tokens_available_clone = tokens_available.clone();
-        
+
         let rwlock = quota.lock.clone();
         let tokens_refill = quota.tokens.clone();
         let tokens = quota.tokens.clone();
@@ -132,8 +134,12 @@ impl FastQuota {
             tokens_available_clone,
         ));
 
-        tokio::spawn(FastQuota::acquire_task(tokens, acquire_receiver, tokens_available, rwlock));
-        
+        tokio::spawn(FastQuota::acquire_task(
+            tokens,
+            acquire_receiver,
+            tokens_available,
+            rwlock,
+        ));
 
         quota
     }
@@ -176,44 +182,51 @@ impl FastQuota {
     }
     async fn slow_path_acquire(self: &Arc<Self>, n: usize) {
         if n > self.max_buffer {
-            panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
         }
         let (sender, receiver) = oneshot::channel();
         let request = AcquireRequest {
             required: n,
             notify: sender,
         };
-        
-        self.acquire_sender.send(request).await.expect("acquire channel closed");
-        
+
+        self.acquire_sender
+            .send(request)
+            .await
+            .expect("acquire channel closed");
+
         receiver.await.unwrap();
     }
 
     async fn fast_path_acquire(self: &Arc<Self>, n: usize) -> bool {
         if n > self.max_buffer {
-            panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
         }
-        
+
         let _read_lck = self.lock.try_read(); // get a read lock first
         if _read_lck.is_err() {
             // can't acuire lock now, let's go to the slow path
             return false; // someone is writing, go to slow path
         }
         let _read_lck = _read_lck.unwrap();
-        let success = self.tokens.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
+        let success = self
+            .tokens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= n {
-                        Some(current - n)
-                    } else {
-                        None
-                    }
+                    Some(current - n)
+                } else {
+                    None
                 }
-        ).is_ok();
-            
-        return success
-        
+            })
+            .is_ok();
+
+        return success;
     }
 
     async fn acquire_task(
@@ -230,19 +243,18 @@ impl FastQuota {
             }
             loop {
                 let success = {
-                    let result = tokens.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |current| {
-                        if current >= request.required {
-                            Some(current - request.required)
-                        } else {
-                            None
-                        }
-                    }).is_ok();
+                    let result = tokens
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            if current >= request.required {
+                                Some(current - request.required)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok();
                     result
                 };
-                
+
                 if success {
                     let _ = request.notify.send(());
                     break;
@@ -259,7 +271,6 @@ impl FastQuota {
         }
     }
 }
-
 
 /// A rate limiter that uses a token bucket algorithm with automatic refilling.
 ///
@@ -320,7 +331,7 @@ impl Quota {
     /// ```
     pub fn new(max_buffer: usize, refill_amount: usize, refill_interval: Duration) -> Arc<Self> {
         let (acquire_sender, acquire_receiver) = mpsc::channel(500);
-        
+
         // Shared notify for refill task to wake up acquire task when tokens are added
         let tokens_available = Arc::new(Notify::new());
 
@@ -335,7 +346,14 @@ impl Quota {
         let max_buffer = quota.max_buffer;
         let tokens_available_refill = tokens_available.clone();
         tokio::spawn(async move {
-            refill_task(tokens_refill, max_buffer, refill_amount, refill_interval, tokens_available_refill).await;
+            refill_task(
+                tokens_refill,
+                max_buffer,
+                refill_amount,
+                refill_interval,
+                tokens_available_refill,
+            )
+            .await;
         });
 
         // Spawn background task 2: Process acquire requests
@@ -380,17 +398,23 @@ impl Quota {
     /// ```
     pub async fn acquire(self: &Arc<Self>, n: usize) {
         if n > self.max_buffer {
-            panic!("requested tokens {} exceed max buffer size {}", n, self.max_buffer);
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
         }
         let (sender, receiver) = oneshot::channel();
         let request = AcquireRequest {
             required: n,
             notify: sender,
         };
-        
+
         // All acquire requests go through the mpsc channel
-        self.acquire_sender.send(request).await.expect("acquire channel closed");
-        
+        self.acquire_sender
+            .send(request)
+            .await
+            .expect("acquire channel closed");
+
         // Wait for completion of acquire request
         // but we also check the flag in case we missed the notification
 
@@ -417,12 +441,10 @@ async fn refill_task(
     interval_timer.tick().await; // tick immediately to only start refill after the first interval
     loop {
         interval_timer.tick().await;
-        
+
         // Try to atomically add tokens if we're not at capacity
-        let added = tokens.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| {
+        let added = tokens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= capacity {
                     None // Already at capacity, don't update
                 } else {
@@ -433,9 +455,9 @@ async fn refill_task(
                         None
                     }
                 }
-            }
-        ).is_ok();
-        
+            })
+            .is_ok();
+
         if added {
             // Successfully added tokens, notify acquire task
             tokens_available.notify_one();
@@ -457,18 +479,16 @@ async fn acquire_task(
         // Wait until we can fulfill this request
         loop {
             // Try to atomically subtract tokens if we have enough
-            let success = tokens.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |current| {
+            let success = tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     if current >= request.required {
                         Some(current - request.required)
                     } else {
                         None // Not enough tokens, don't update
                     }
-                }
-            ).is_ok();
-            
+                })
+                .is_ok();
+
             if success {
                 // Successfully acquired tokens atomically
                 let _ = request.notify.send(());
@@ -483,6 +503,391 @@ async fn acquire_task(
     }
 }
 
+// ============================================================================
+// Synchronous (blocking) implementations
+// ============================================================================
+
+struct SyncAcquireRequest {
+    required: usize,
+    notify: Arc<(Mutex<bool>, Condvar)>,
+}
+
+/// A synchronous rate limiter with perfect FIFO ordering.
+///
+/// `QuotaSync` provides the same functionality as `Quota` but uses blocking operations
+/// instead of async/await. This makes it suitable for use in non-async contexts.
+///
+/// The quota starts with `max_buffer` tokens available. Tokens are automatically
+/// refilled at fixed intervals by a background thread. Acquire requests are processed
+/// in strict FIFO order by a separate background thread, ensuring perfect fairness.
+///
+/// The quota is designed to be shared across many threads. Clone the `Arc<QuotaSync>`
+/// to share it between threads.
+///
+/// # Example
+///
+/// ```no_run
+/// use precise_rate_limiter::QuotaSync;
+/// use std::time::Duration;
+///
+/// let quota = QuotaSync::new(1000, 100, Duration::from_millis(100));
+///
+/// // Acquire 50 tokens (will block if not enough available)
+/// quota.acquire(50);
+///
+/// // Acquire more tokens
+/// quota.acquire(200);
+/// ```
+pub struct QuotaSync {
+    tokens: Arc<AtomicUsize>,
+    max_buffer: usize,
+    acquire_sender: std::sync::mpsc::SyncSender<SyncAcquireRequest>,
+}
+
+impl QuotaSync {
+    /// Creates a new synchronous quota with the specified parameters.
+    ///
+    /// The quota starts with `max_buffer` tokens available. A background thread
+    /// automatically refills `refill_amount` tokens every `refill_interval`,
+    /// up to the `max_buffer` limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_buffer` - Maximum number of tokens that can be stored.
+    /// * `refill_amount` - Number of tokens to add per refill interval.
+    /// * `refill_interval` - Time interval between refills.
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<QuotaSync>` that can be cloned and shared across threads.
+    pub fn new(max_buffer: usize, refill_amount: usize, refill_interval: Duration) -> Arc<Self> {
+        let (acquire_sender, acquire_receiver) = std::sync::mpsc::sync_channel(500);
+
+        let quota = Arc::new(Self {
+            tokens: Arc::new(AtomicUsize::new(max_buffer)),
+            max_buffer,
+            acquire_sender,
+        });
+
+        // Spawn background thread for refilling tokens
+        let tokens_refill = quota.tokens.clone();
+        thread::spawn(move || {
+            sync_refill_task(tokens_refill, max_buffer, refill_amount, refill_interval);
+        });
+
+        // Spawn background thread for processing acquire requests
+        let tokens_acquire = quota.tokens.clone();
+        thread::spawn(move || {
+            sync_acquire_task(tokens_acquire, acquire_receiver);
+        });
+
+        quota
+    }
+
+    /// Acquires `n` tokens from the quota.
+    ///
+    /// This method will block until enough tokens are available. The request is
+    /// queued in FIFO order, ensuring fair processing of concurrent acquire requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Number of tokens to acquire. Must be `<= max_buffer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n > max_buffer`.
+    pub fn acquire(self: &Arc<Self>, n: usize) {
+        if n > self.max_buffer {
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
+        }
+
+        let notify = Arc::new((Mutex::new(false), Condvar::new()));
+        let request = SyncAcquireRequest {
+            required: n,
+            notify: notify.clone(),
+        };
+
+        self.acquire_sender
+            .send(request)
+            .expect("acquire channel closed");
+
+        // Wait for completion
+        let (lock, cvar) = &*notify;
+        let mut completed = lock.lock().unwrap();
+        while !*completed {
+            completed = cvar.wait(completed).unwrap();
+        }
+    }
+}
+
+/// Background thread that automatically refills tokens at fixed intervals.
+fn sync_refill_task(
+    tokens: Arc<AtomicUsize>,
+    capacity: usize,
+    refill_amount: usize,
+    refill_interval: Duration,
+) {
+    loop {
+        thread::sleep(refill_interval);
+
+        let _ = tokens.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            if current >= capacity {
+                None
+            } else {
+                let to_add = (capacity - current).min(refill_amount);
+                if to_add > 0 {
+                    Some(current + to_add)
+                } else {
+                    None
+                }
+            }
+        });
+    }
+}
+
+/// Background thread that processes acquire requests in FIFO order.
+fn sync_acquire_task(
+    tokens: Arc<AtomicUsize>,
+    receiver: std::sync::mpsc::Receiver<SyncAcquireRequest>,
+) {
+    while let Ok(request) = receiver.recv() {
+        // Wait until we can fulfill this request
+        loop {
+            let success = tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    if current >= request.required {
+                        Some(current - request.required)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+
+            if success {
+                // Notify the waiting thread
+                let (lock, cvar) = &*request.notify;
+                let mut completed = lock.lock().unwrap();
+                *completed = true;
+                cvar.notify_one();
+                break;
+            } else {
+                // Not enough tokens, sleep briefly and try again
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// A synchronous rate limiter with fast-path optimization for low-contention scenarios.
+///
+/// `FastQuotaSync` provides the same functionality as `FastQuota` but uses blocking operations
+/// instead of async/await. This makes it suitable for use in non-async contexts.
+///
+/// Uses a two-path design:
+/// - **Fast path**: Direct token acquisition when there's no contention
+/// - **Slow path**: FIFO-queued processing when there is contention
+///
+/// The fast path optimization prioritizes performance over perfect fairness, providing
+/// best-effort FIFO ordering.
+///
+/// # Example
+///
+/// ```no_run
+/// use precise_rate_limiter::FastQuotaSync;
+/// use std::time::Duration;
+///
+/// let quota = FastQuotaSync::new(1000, 100, Duration::from_millis(100));
+///
+/// // Attempts fast path first, falls back to slow path if needed
+/// quota.acquire(50);
+/// quota.acquire(200);
+/// ```
+pub struct FastQuotaSync {
+    tokens: Arc<AtomicUsize>,
+    max_buffer: usize,
+    acquire_sender: std::sync::mpsc::SyncSender<SyncAcquireRequest>,
+    lock: Arc<std::sync::RwLock<()>>,
+}
+
+impl FastQuotaSync {
+    /// Creates a new fast synchronous quota with the specified parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_buffer` - Maximum number of tokens that can be stored.
+    /// * `refill_amount` - Number of tokens to add per refill interval.
+    /// * `refill_interval` - Time interval between refills.
+    ///
+    /// # Returns
+    ///
+    /// Returns an `Arc<FastQuotaSync>` that can be cloned and shared across threads.
+    pub fn new(max_buffer: usize, refill_amount: usize, refill_interval: Duration) -> Arc<Self> {
+        let (acquire_sender, acquire_receiver) = std::sync::mpsc::sync_channel(500);
+
+        let quota = Arc::new(Self {
+            tokens: Arc::new(AtomicUsize::new(max_buffer)),
+            max_buffer,
+            acquire_sender,
+            lock: Arc::new(std::sync::RwLock::new(())),
+        });
+
+        // Spawn background thread for refilling tokens
+        let tokens_refill = quota.tokens.clone();
+        thread::spawn(move || {
+            sync_refill_task(tokens_refill, max_buffer, refill_amount, refill_interval);
+        });
+
+        // Spawn background thread for processing acquire requests
+        let tokens_acquire = quota.tokens.clone();
+        let rwlock = quota.lock.clone();
+        thread::spawn(move || {
+            sync_fast_acquire_task(tokens_acquire, acquire_receiver, rwlock);
+        });
+
+        quota
+    }
+
+    /// Acquires `n` tokens from the quota.
+    ///
+    /// This method attempts a fast-path acquisition first. If the fast path fails
+    /// (due to lock contention or insufficient tokens), it falls back to the slow
+    /// path, which queues the request for FIFO processing.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Number of tokens to acquire. Must be `<= max_buffer`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n > max_buffer`.
+    pub fn acquire(self: &Arc<Self>, n: usize) {
+        if !self.fast_path_acquire(n) {
+            self.slow_path_acquire(n);
+        }
+    }
+
+    fn fast_path_acquire(&self, n: usize) -> bool {
+        if n > self.max_buffer {
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
+        }
+
+        // Try to get a read lock first
+        let _read_lock = self.lock.try_read();
+        if _read_lock.is_err() {
+            return false; // Someone is writing, go to slow path
+        }
+
+        let success = self
+            .tokens
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                if current >= n {
+                    Some(current - n)
+                } else {
+                    None
+                }
+            })
+            .is_ok();
+
+        success
+    }
+
+    fn slow_path_acquire(&self, n: usize) {
+        if n > self.max_buffer {
+            panic!(
+                "requested tokens {} exceed max buffer size {}",
+                n, self.max_buffer
+            );
+        }
+
+        let notify = Arc::new((Mutex::new(false), Condvar::new()));
+        let request = SyncAcquireRequest {
+            required: n,
+            notify: notify.clone(),
+        };
+
+        self.acquire_sender
+            .send(request)
+            .expect("acquire channel closed");
+
+        // Wait for completion
+        let (lock, cvar) = &*notify;
+        let mut completed = lock.lock().unwrap();
+        while !*completed {
+            completed = cvar.wait(completed).unwrap();
+        }
+    }
+}
+
+/// Background thread that processes acquire requests with write lock for FIFO ordering.
+fn sync_fast_acquire_task(
+    tokens: Arc<AtomicUsize>,
+    receiver: std::sync::mpsc::Receiver<SyncAcquireRequest>,
+    lock: Arc<std::sync::RwLock<()>>,
+) {
+    let mut _write_lock = None;
+    let mut pending_request: Option<SyncAcquireRequest> = None;
+
+    loop {
+        // Get next request - either from pending or from receiver
+        let request = if let Some(req) = pending_request.take() {
+            req
+        } else {
+            match receiver.recv() {
+                Ok(req) => req,
+                Err(_) => break, // Channel closed
+            }
+        };
+
+        if _write_lock.is_none() {
+            // Acquire write lock to block fast path
+            _write_lock = Some(lock.write().unwrap());
+        }
+
+        // Wait until we can fulfill this request
+        loop {
+            let success = tokens
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    if current >= request.required {
+                        Some(current - request.required)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok();
+
+            if success {
+                // Notify the waiting thread
+                let (lock, cvar) = &*request.notify;
+                let mut completed = lock.lock().unwrap();
+                *completed = true;
+                cvar.notify_one();
+                break;
+            } else {
+                // Not enough tokens, sleep briefly and try again
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        // Check if there are more waiters
+        match receiver.try_recv() {
+            Ok(next_request) => {
+                // There's another request waiting, keep the write lock and process it
+                pending_request = Some(next_request);
+            }
+            Err(_) => {
+                // No more waiters, release write lock
+                _write_lock = None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,27 +896,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_acquire() {
-        let quota = Quota::new(10,  1, Duration::from_millis(1));
-        
+        let quota = Quota::new(10, 1, Duration::from_millis(1));
+
         // Should acquire immediately since we start with capacity
         let start = Instant::now();
         quota.acquire(10).await;
         let elapsed = start.elapsed();
-        
+
         // Should be very fast (no waiting)
         assert!(elapsed < Duration::from_millis(50));
     }
 
-
-        #[tokio::test]
+    #[tokio::test]
     async fn test_basic_acquire_unfair() {
-        let quota = FastQuota::new(10,  1, Duration::from_millis(1));
-        
+        let quota = FastQuota::new(10, 1, Duration::from_millis(1));
+
         // Should acquire immediately since we start with capacity
         let start = Instant::now();
         quota.acquire(10).await;
         let elapsed = start.elapsed();
-        
+
         // Should be very fast (no waiting)
         assert!(elapsed < Duration::from_millis(50));
     }
@@ -519,14 +923,14 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_limit_unfair() {
         let quota = FastQuota::new(10, 1, Duration::from_millis(1000));
-        
+
         // Acquire all tokens
         let start = Instant::now();
         quota.acquire(10).await;
-        
+
         let elapsed = start.elapsed();
         assert!(elapsed <= Duration::from_millis(20)); // acquire should be very fast
-        // Next acquire should wait
+                                                       // Next acquire should wait
         let start = Instant::now();
         let handle = tokio::spawn({
             let quota = quota.clone();
@@ -534,29 +938,29 @@ mod tests {
                 quota.acquire(1).await;
             }
         });
-        
+
         // Wait a bit to ensure it's waiting
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!handle.is_finished());
-        
+
         // Wait for refill (should happen after ~100ms)
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        
+
         // Should have waited for refill
         assert!(elapsed >= Duration::from_millis(900));
     }
     #[tokio::test]
     async fn test_capacity_limit() {
         let quota = Quota::new(10, 1, Duration::from_millis(1000));
-        
+
         // Acquire all tokens
         let start = Instant::now();
         quota.acquire(10).await;
-        
+
         let elapsed = start.elapsed();
         assert!(elapsed <= Duration::from_millis(20)); // acquire should be very fast
-        // Next acquire should wait
+                                                       // Next acquire should wait
         let start = Instant::now();
         let handle = tokio::spawn({
             let quota = quota.clone();
@@ -564,34 +968,33 @@ mod tests {
                 quota.acquire(1).await;
             }
         });
-        
+
         // Wait a bit to ensure it's waiting
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!handle.is_finished());
-        
+
         // Wait for refill (should happen after ~100ms)
         handle.await.unwrap();
         let elapsed = start.elapsed();
-        
+
         // Should have waited for refill
         assert!(elapsed >= Duration::from_millis(900));
     }
 
-
-        #[tokio::test]
+    #[tokio::test]
     async fn test_one_per_ms_100_acquirers_unfair() {
         let quota = FastQuota::new(
-            1,                    // capacity: 1 token
-            1,                    // refill amount: 1 token
+            1,                        // capacity: 1 token
+            1,                        // refill amount: 1 token
             Duration::from_millis(1), // refill interval: 1 second
         );
-        
+
         let start = Instant::now();
         let acquired_count = Arc::new(AtomicU64::new(0));
         let acquired_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         println!("Starting test: 1 token per millisecond, 100 acquirers");
-        
+
         // Spawn 100 acquirer tasks
         let mut handles = vec![];
         for i in 0..100 {
@@ -603,10 +1006,10 @@ mod tests {
                 quota.acquire(1).await;
                 let elapsed = acquire_start.elapsed();
                 let total_elapsed = start.elapsed();
-                
+
                 count.fetch_add(1, AtomicOrdering::Relaxed);
                 times.lock().unwrap().push((i, total_elapsed, elapsed));
-                
+
                 println!(
                     "Acquirer {} acquired token at {:.2}s (waited {:.2}ms)",
                     i,
@@ -615,47 +1018,55 @@ mod tests {
                 );
             }));
         }
-        
+
         // Wait for all to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_time = start.elapsed();
         let times = acquired_times.lock().unwrap();
-        
+
         println!("\nTest Results:");
         println!("Total time: {:.2}ms", total_time.as_millis());
-        println!("Total acquired: {}", acquired_count.load(AtomicOrdering::Relaxed));
+        println!(
+            "Total acquired: {}",
+            acquired_count.load(AtomicOrdering::Relaxed)
+        );
         println!("Expected time: ~100s (100 tokens at 1 per second)");
-        
+
         // Verify all 100 acquired
         assert_eq!(acquired_count.load(AtomicOrdering::Relaxed), 100);
-        
+
         // Should take approximately 100 seconds (allowing some variance)
         assert!(total_time >= Duration::from_secs(0));
         assert!(total_time <= Duration::from_millis(120));
-        
+
         // Verify tokens were acquired roughly 1 per second
         let mut prev_time = Duration::ZERO;
         for (i, time, _) in times.iter().take(10) {
             if i > &0 {
                 let interval = *time - prev_time;
-                println!("Interval between acquirer {} and {}: {:.2}ms", i - 1, i, interval.as_millis());
+                println!(
+                    "Interval between acquirer {} and {}: {:.2}ms",
+                    i - 1,
+                    i,
+                    interval.as_millis()
+                );
                 // Should be roughly 1 second apart (allowing 0.5s variance)
                 assert!(interval >= Duration::from_millis(0));
                 assert!(interval <= Duration::from_millis(20));
             }
             prev_time = *time;
         }
-        
+
         println!("Test passed!");
     }
     #[tokio::test]
     async fn test_multiple_concurrent_acquires() {
         let quota = Quota::new(10, 1, Duration::from_millis(50));
         let acquired_count = Arc::new(AtomicU64::new(0));
-        
+
         // Spawn 20 tasks trying to acquire 1 token each
         let mut handles = vec![];
         for i in 0..20 {
@@ -667,12 +1078,12 @@ mod tests {
                 i
             }));
         }
-        
+
         // Wait for all to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         // All 20 should eventually acquire
         assert_eq!(acquired_count.load(AtomicOrdering::Relaxed), 20);
     }
@@ -681,7 +1092,7 @@ mod tests {
     async fn test_multiple_concurrent_acquires_unfair() {
         let quota = FastQuota::new(10, 1, Duration::from_millis(50));
         let acquired_count = Arc::new(AtomicU64::new(0));
-        
+
         // Spawn 20 tasks trying to acquire 1 token each
         let mut handles = vec![];
         for i in 0..20 {
@@ -693,31 +1104,30 @@ mod tests {
                 i
             }));
         }
-        
+
         // Wait for all to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         // All 20 should eventually acquire
         assert_eq!(acquired_count.load(AtomicOrdering::Relaxed), 20);
     }
-    
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_one_per_ms_100_acquirers() {
         let quota = Quota::new(
-            1,                    // capacity: 1 token
-            1,                    // refill amount: 1 token
+            1,                        // capacity: 1 token
+            1,                        // refill amount: 1 token
             Duration::from_millis(1), // refill interval: 1 second
         );
-        
+
         let start = Instant::now();
         let acquired_count = Arc::new(AtomicU64::new(0));
         let acquired_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         println!("Starting test: 1 token per millisecond, 100 acquirers");
-        
+
         // Spawn 100 acquirer tasks
         let mut handles = vec![];
         for i in 0..100 {
@@ -729,10 +1139,10 @@ mod tests {
                 quota.acquire(1).await;
                 let elapsed = acquire_start.elapsed();
                 let total_elapsed = start.elapsed();
-                
+
                 count.fetch_add(1, AtomicOrdering::Relaxed);
                 times.lock().unwrap().push((i, total_elapsed, elapsed));
-                
+
                 println!(
                     "Acquirer {} acquired token at {:.2}s (waited {:.2}ms)",
                     i,
@@ -741,40 +1151,48 @@ mod tests {
                 );
             }));
         }
-        
+
         // Wait for all to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_time = start.elapsed();
         let times = acquired_times.lock().unwrap();
-        
+
         println!("\nTest Results:");
         println!("Total time: {:.2}ms", total_time.as_millis());
-        println!("Total acquired: {}", acquired_count.load(AtomicOrdering::Relaxed));
+        println!(
+            "Total acquired: {}",
+            acquired_count.load(AtomicOrdering::Relaxed)
+        );
         println!("Expected time: ~100s (100 tokens at 1 per second)");
-        
+
         // Verify all 100 acquired
         assert_eq!(acquired_count.load(AtomicOrdering::Relaxed), 100);
-        
+
         // Should take approximately 100 seconds (allowing some variance)
         assert!(total_time >= Duration::from_secs(0));
         assert!(total_time <= Duration::from_millis(120));
-        
+
         // Verify tokens were acquired roughly 1 per second
         let mut prev_time = Duration::ZERO;
         for (i, time, _) in times.iter().take(10) {
             if i > &0 {
                 let interval = *time - prev_time;
-                println!("Interval between acquirer {} and {}: {:.2}ms", i - 1, i, interval.as_millis());
+                println!(
+                    "Interval between acquirer {} and {}: {:.2}ms",
+                    i - 1,
+                    i,
+                    interval.as_millis()
+                );
                 // Should be roughly 1 second apart (allowing 0.5s variance)
                 assert!(interval >= Duration::from_millis(0));
                 assert!(interval <= Duration::from_millis(20));
             }
             prev_time = *time;
         }
-        
+
         println!("Test passed!");
     }
     #[tokio::test]
@@ -782,10 +1200,10 @@ mod tests {
         let quota = FastQuota::new(5, 1, Duration::from_millis(100));
         let start = Instant::now();
         let acquired_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         // Acquire all initial tokens
         quota.acquire(5).await;
-        
+
         // Try to acquire 10 more (should be rate limited)
         let mut handles = vec![];
         for i in 0..10 {
@@ -797,11 +1215,11 @@ mod tests {
                 times.lock().unwrap().push((i, elapsed));
             }));
         }
-        
+
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let times = acquired_times.lock().unwrap();
         // Should have taken at least 1 second (10 tokens / 1 per 100ms)
         let total_time = times.iter().map(|(_, t)| *t).max().unwrap();
@@ -812,10 +1230,10 @@ mod tests {
         let quota = Quota::new(5, 1, Duration::from_millis(100));
         let start = Instant::now();
         let acquired_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         // Acquire all initial tokens
         quota.acquire(5).await;
-        
+
         // Try to acquire 10 more (should be rate limited)
         let mut handles = vec![];
         for i in 0..10 {
@@ -827,21 +1245,18 @@ mod tests {
                 times.lock().unwrap().push((i, elapsed));
             }));
         }
-        
+
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let times = acquired_times.lock().unwrap();
         // Should have taken at least 1 second (10 tokens / 1 per 100ms)
         let total_time = times.iter().map(|(_, t)| *t).max().unwrap();
         assert!(total_time >= Duration::from_millis(900));
     }
 
-
- 
-
-        #[tokio::test]
+    #[tokio::test]
     async fn test_large_acquire_request_unfair() {
         let quota = FastQuota::new(2000, 1, Duration::from_millis(1));
         quota.acquire(2000).await;
@@ -850,7 +1265,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(1000), quota.acquire(1500)).await;
         assert!(result.is_err());
         let elapsed = start.elapsed();
-        
+
         // Should wait until enough tokens accumulate
         // 15 tokens - 10 initial = 5 more needed
         // At 1 per 100ms, that's ~500ms
@@ -866,7 +1281,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(1000), quota.acquire(1500)).await;
         assert!(result.is_err());
         let elapsed = start.elapsed();
-        
+
         // Should wait until enough tokens accumulate
         // 15 tokens - 10 initial = 5 more needed
         // At 1 per 100ms, that's ~500ms
@@ -878,17 +1293,20 @@ mod tests {
         // Refill: 100 million tokens per 100ms
         // Max buffer: 10 billion tokens
         let quota = Quota::new(
-            10_000_000_000,              // max_buffer: 10 billion
-            100_000_000,                  // refill_amount: 100 million
-            Duration::from_millis(100),   // refill_interval: 100ms
+            10_000_000_000,             // max_buffer: 10 billion
+            100_000_000,                // refill_amount: 100 million
+            Duration::from_millis(100), // refill_interval: 100ms
         );
-        
+
         let start = Instant::now();
         let acquired_count = Arc::new(AtomicU64::new(0));
-        
+
         let threads = 5;
-        println!("Starting throughput test: {} threads acquiring tokens for 10 seconds...", threads);
-        
+        println!(
+            "Starting throughput test: {} threads acquiring tokens for 10 seconds...",
+            threads
+        );
+
         // Spawn 500 tasks, each acquiring 1 token in a loop
         let mut handles = vec![];
         for _ in 0..threads {
@@ -904,40 +1322,48 @@ mod tests {
                 local_count
             }));
         }
-        
+
         // Wait for all tasks to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_acquired = acquired_count.load(AtomicOrdering::Relaxed);
         let elapsed = start.elapsed();
-        
+
         println!("\nThroughput Test Results:");
-        println!("Total tokens acquired by all {} threads: {}", threads, total_acquired);
+        println!(
+            "Total tokens acquired by all {} threads: {}",
+            threads, total_acquired
+        );
         println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
-        println!("Tokens per second: {:.2}", total_acquired as f64 / elapsed.as_secs_f64());
+        println!(
+            "Tokens per second: {:.2}",
+            total_acquired as f64 / elapsed.as_secs_f64()
+        );
         println!("Expected refill rate: 1,000,000,000 tokens/second (100M per 100ms)");
         println!("\nTest completed successfully!");
     }
 
-
-     #[tokio::test]
+    #[tokio::test]
     async fn test_throughput_100m_per_100ms_unfair() {
         // Refill: 100 million tokens per 100ms
         // Max buffer: 10 billion tokens
         let quota = FastQuota::new(
-            10_000_000_000,              // max_buffer: 10 billion
-            100_000_000,                  // refill_amount: 100 million
-            Duration::from_millis(100),   // refill_interval: 100ms
+            10_000_000_000,             // max_buffer: 10 billion
+            100_000_000,                // refill_amount: 100 million
+            Duration::from_millis(100), // refill_interval: 100ms
         );
-        
+
         let start = Instant::now();
         let acquired_count = Arc::new(AtomicU64::new(0));
-        
+
         let threads = 5;
-        println!("Starting throughput test: {} threads acquiring tokens for 10 seconds...", threads);
-        
+        println!(
+            "Starting throughput test: {} threads acquiring tokens for 10 seconds...",
+            threads
+        );
+
         // Spawn 500 tasks, each acquiring 1 token in a loop
         let mut handles = vec![];
         for _ in 0..threads {
@@ -953,19 +1379,25 @@ mod tests {
                 local_count
             }));
         }
-        
+
         // Wait for all tasks to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_acquired = acquired_count.load(AtomicOrdering::Relaxed);
         let elapsed = start.elapsed();
-        
+
         println!("\nThroughput Test Results:");
-        println!("Total tokens acquired by all {} threads: {}", threads, total_acquired);
+        println!(
+            "Total tokens acquired by all {} threads: {}",
+            threads, total_acquired
+        );
         println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
-        println!("Tokens per second: {:.2}", total_acquired as f64 / elapsed.as_secs_f64());
+        println!(
+            "Tokens per second: {:.2}",
+            total_acquired as f64 / elapsed.as_secs_f64()
+        );
         println!("Expected refill rate: 1,000,000,000 tokens/second (100M per 100ms)");
         println!("\nTest completed successfully!");
     }
@@ -973,16 +1405,16 @@ mod tests {
     #[tokio::test]
     async fn test_mpsc_throughput() {
         use tokio::sync::mpsc as tokio_mpsc;
-        
+
         let num_senders = 500;
         let (sender, mut receiver) = tokio_mpsc::channel(500);
-        
+
         let start = Instant::now();
         let sent_count = Arc::new(AtomicU64::new(0));
         let received_count = Arc::new(AtomicU64::new(0));
-        
+
         println!("Starting mpsc throughput test: {} sender threads, 1 receiver thread, running for 10 seconds...", num_senders);
-        
+
         // Spawn sender tasks
         let mut sender_handles = vec![];
         for _ in 0..num_senders {
@@ -1001,7 +1433,7 @@ mod tests {
                 local_sent
             }));
         }
-        
+
         // Spawn receiver task
         let receiver_count = received_count.clone();
         let receiver_handle = tokio::spawn(async move {
@@ -1019,29 +1451,35 @@ mod tests {
             receiver_count.fetch_add(local_received, AtomicOrdering::Relaxed);
             local_received
         });
-        
+
         // Wait for all senders to complete
         for handle in sender_handles {
             handle.await.unwrap();
         }
-        
+
         // Close the sender to signal receiver to stop
         drop(sender);
-        
+
         // Wait for receiver to complete
         receiver_handle.await.unwrap();
-        
+
         let total_sent = sent_count.load(AtomicOrdering::Relaxed);
         let total_received = received_count.load(AtomicOrdering::Relaxed);
         let elapsed = start.elapsed();
-        
+
         println!("\nMPSC Throughput Test Results:");
         println!("Number of sender threads: {}", num_senders);
         println!("Total messages sent: {}", total_sent);
         println!("Total messages received: {}", total_received);
         println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
-        println!("Sends per second: {:.2}", total_sent as f64 / elapsed.as_secs_f64());
-        println!("Receives per second: {:.2}", total_received as f64 / elapsed.as_secs_f64());
+        println!(
+            "Sends per second: {:.2}",
+            total_sent as f64 / elapsed.as_secs_f64()
+        );
+        println!(
+            "Receives per second: {:.2}",
+            total_received as f64 / elapsed.as_secs_f64()
+        );
         println!("\nTest completed successfully!");
     }
 
@@ -1049,18 +1487,18 @@ mod tests {
     async fn test_contention_transition_quota() {
         // Quota: 100 tokens max, refill 10 tokens every 100ms
         let quota = Quota::new(100, 10, Duration::from_millis(100));
-        
+
         let start = Instant::now();
         let acquire_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         println!("\n=== Quota: Contention Transition Test ===");
         println!("Starting with low contention, gradually increasing to high contention");
-        
+
         // Spawn 50 tasks, each making multiple acquires with decreasing sleep intervals
         let num_tasks = 50;
         let acquires_per_task = 10;
         let mut handles = vec![];
-        
+
         for task_id in 0..num_tasks {
             let quota = quota.clone();
             let times = acquire_times.clone();
@@ -1072,54 +1510,60 @@ mod tests {
                     if sleep_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
                     }
-                    
+
                     let acquire_start = Instant::now();
                     quota.acquire(1).await;
                     let wait_time = acquire_start.elapsed();
                     let total_elapsed = start.elapsed();
-                    
-                    times.lock().unwrap().push((task_id, acquire_num, total_elapsed, wait_time));
+
+                    times
+                        .lock()
+                        .unwrap()
+                        .push((task_id, acquire_num, total_elapsed, wait_time));
                 }
             }));
         }
-        
+
         // Wait for all tasks to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_time = start.elapsed();
         let times = acquire_times.lock().unwrap();
         let total_acquires = times.len();
-        
+
         // Calculate statistics
         let mut wait_times: Vec<Duration> = times.iter().map(|(_, _, _, wait)| *wait).collect();
         wait_times.sort();
-        
+
         let total_wait_secs: f64 = wait_times.iter().map(|d| d.as_secs_f64()).sum();
         let avg_wait_secs = total_wait_secs / wait_times.len() as f64;
         let avg_wait = Duration::from_secs_f64(avg_wait_secs);
         let median_wait = wait_times[wait_times.len() / 2];
         let min_wait = wait_times[0];
         let max_wait = wait_times[wait_times.len() - 1];
-        
+
         // Calculate effective rate
         let effective_rate = total_acquires as f64 / total_time.as_secs_f64();
-        
+
         // Calculate fairness: variance in wait times
-        let wait_variance: f64 = wait_times.iter()
+        let wait_variance: f64 = wait_times
+            .iter()
             .map(|w| {
                 let diff = w.as_secs_f64() - avg_wait.as_secs_f64();
                 diff * diff
             })
-            .sum::<f64>() / wait_times.len() as f64;
+            .sum::<f64>()
+            / wait_times.len() as f64;
         let wait_stddev = wait_variance.sqrt();
-        
+
         // Calculate order preservation: check if tasks that started earlier generally acquired earlier
         // Group by task and calculate average acquire time per task
         let mut task_avg_times: Vec<(usize, Duration)> = Vec::new();
         for task_id in 0..num_tasks {
-            let task_acquires: Vec<Duration> = times.iter()
+            let task_acquires: Vec<Duration> = times
+                .iter()
                 .filter(|(t, _, _, _)| *t == task_id)
                 .map(|(_, _, elapsed, _)| *elapsed)
                 .collect();
@@ -1131,11 +1575,11 @@ mod tests {
             }
         }
         task_avg_times.sort_by_key(|(_, time)| *time);
-        
+
         // Calculate fairness score: how evenly distributed wait times are
         // Lower variance = more fair
         let fairness_score = 1.0 / (1.0 + wait_stddev * 1000.0); // Normalize to 0-1 range
-        
+
         println!("\n=== Quota Statistics ===");
         println!("Total acquires: {}", total_acquires);
         println!("Total time: {:.2}s", total_time.as_secs_f64());
@@ -1148,16 +1592,27 @@ mod tests {
         println!("  Max wait: {:.2}ms", max_wait.as_secs_f64() * 1000.0);
         println!("  Std deviation: {:.2}ms", wait_stddev * 1000.0);
         println!("\nFairness Metrics:");
-        println!("  Fairness score: {:.4} (1.0 = perfect fairness)", fairness_score);
+        println!(
+            "  Fairness score: {:.4} (1.0 = perfect fairness)",
+            fairness_score
+        );
         println!("  Wait time variance: {:.4}", wait_variance);
-        
+
         // Verify all acquires completed
         assert_eq!(total_acquires, num_tasks * acquires_per_task);
-        
+
         // Effective rate should be close to refill rate (with some overhead)
-        assert!(effective_rate > 50.0, "Effective rate too low: {:.2}", effective_rate);
-        assert!(effective_rate < 150.0, "Effective rate too high: {:.2}", effective_rate);
-        
+        assert!(
+            effective_rate > 50.0,
+            "Effective rate too low: {:.2}",
+            effective_rate
+        );
+        assert!(
+            effective_rate < 150.0,
+            "Effective rate too high: {:.2}",
+            effective_rate
+        );
+
         println!("\n=== Quota Test Passed ===\n");
     }
 
@@ -1165,18 +1620,18 @@ mod tests {
     async fn test_contention_transition_fastquota() {
         // FastQuota: 100 tokens max, refill 10 tokens every 100ms
         let quota = FastQuota::new(100, 10, Duration::from_millis(100));
-        
+
         let start = Instant::now();
         let acquire_times = Arc::new(std::sync::Mutex::new(Vec::new()));
-        
+
         println!("\n=== FastQuota: Contention Transition Test ===");
         println!("Starting with low contention, gradually increasing to high contention");
-        
+
         // Spawn 50 tasks, each making multiple acquires with decreasing sleep intervals
         let num_tasks = 50;
         let acquires_per_task = 10;
         let mut handles = vec![];
-        
+
         for task_id in 0..num_tasks {
             let quota = quota.clone();
             let times = acquire_times.clone();
@@ -1188,54 +1643,60 @@ mod tests {
                     if sleep_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
                     }
-                    
+
                     let acquire_start = Instant::now();
                     quota.acquire(1).await;
                     let wait_time = acquire_start.elapsed();
                     let total_elapsed = start.elapsed();
-                    
-                    times.lock().unwrap().push((task_id, acquire_num, total_elapsed, wait_time));
+
+                    times
+                        .lock()
+                        .unwrap()
+                        .push((task_id, acquire_num, total_elapsed, wait_time));
                 }
             }));
         }
-        
+
         // Wait for all tasks to complete
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let total_time = start.elapsed();
         let times = acquire_times.lock().unwrap();
         let total_acquires = times.len();
-        
+
         // Calculate statistics
         let mut wait_times: Vec<Duration> = times.iter().map(|(_, _, _, wait)| *wait).collect();
         wait_times.sort();
-        
+
         let total_wait_secs: f64 = wait_times.iter().map(|d| d.as_secs_f64()).sum();
         let avg_wait_secs = total_wait_secs / wait_times.len() as f64;
         let avg_wait = Duration::from_secs_f64(avg_wait_secs);
         let median_wait = wait_times[wait_times.len() / 2];
         let min_wait = wait_times[0];
         let max_wait = wait_times[wait_times.len() - 1];
-        
+
         // Calculate effective rate
         let effective_rate = total_acquires as f64 / total_time.as_secs_f64();
-        
+
         // Calculate fairness: variance in wait times
-        let wait_variance: f64 = wait_times.iter()
+        let wait_variance: f64 = wait_times
+            .iter()
             .map(|w| {
                 let diff = w.as_secs_f64() - avg_wait.as_secs_f64();
                 diff * diff
             })
-            .sum::<f64>() / wait_times.len() as f64;
+            .sum::<f64>()
+            / wait_times.len() as f64;
         let wait_stddev = wait_variance.sqrt();
-        
+
         // Calculate order preservation: check if tasks that started earlier generally acquired earlier
         // Group by task and calculate average acquire time per task
         let mut task_avg_times: Vec<(usize, Duration)> = Vec::new();
         for task_id in 0..num_tasks {
-            let task_acquires: Vec<Duration> = times.iter()
+            let task_acquires: Vec<Duration> = times
+                .iter()
                 .filter(|(t, _, _, _)| *t == task_id)
                 .map(|(_, _, elapsed, _)| *elapsed)
                 .collect();
@@ -1247,25 +1708,31 @@ mod tests {
             }
         }
         task_avg_times.sort_by_key(|(_, time)| *time);
-        
+
         // Calculate fairness score: how evenly distributed wait times are
         // Lower variance = more fair
         let fairness_score = 1.0 / (1.0 + wait_stddev * 1000.0); // Normalize to 0-1 range
-        
+
         // Count fast path vs slow path (approximate: very short waits likely fast path)
         let fast_path_count = wait_times.iter().filter(|w| w.as_millis() < 1).count();
         let slow_path_count = total_acquires - fast_path_count;
-        
+
         println!("\n=== FastQuota Statistics ===");
         println!("Total acquires: {}", total_acquires);
         println!("Total time: {:.2}s", total_time.as_secs_f64());
         println!("Effective rate: {:.2} acquires/sec", effective_rate);
         println!("Expected max rate: ~100 acquires/sec (10 tokens per 100ms)");
         println!("\nPath Usage (estimated):");
-        println!("  Fast path (wait < 1ms): {} ({:.1}%)", fast_path_count, 
-                 fast_path_count as f64 / total_acquires as f64 * 100.0);
-        println!("  Slow path (wait >= 1ms): {} ({:.1}%)", slow_path_count,
-                 slow_path_count as f64 / total_acquires as f64 * 100.0);
+        println!(
+            "  Fast path (wait < 1ms): {} ({:.1}%)",
+            fast_path_count,
+            fast_path_count as f64 / total_acquires as f64 * 100.0
+        );
+        println!(
+            "  Slow path (wait >= 1ms): {} ({:.1}%)",
+            slow_path_count,
+            slow_path_count as f64 / total_acquires as f64 * 100.0
+        );
         println!("\nWait Time Statistics:");
         println!("  Average wait: {:.2}ms", avg_wait.as_secs_f64() * 1000.0);
         println!("  Median wait: {:.2}ms", median_wait.as_secs_f64() * 1000.0);
@@ -1273,16 +1740,189 @@ mod tests {
         println!("  Max wait: {:.2}ms", max_wait.as_secs_f64() * 1000.0);
         println!("  Std deviation: {:.2}ms", wait_stddev * 1000.0);
         println!("\nFairness Metrics:");
-        println!("  Fairness score: {:.4} (1.0 = perfect fairness)", fairness_score);
+        println!(
+            "  Fairness score: {:.4} (1.0 = perfect fairness)",
+            fairness_score
+        );
         println!("  Wait time variance: {:.4}", wait_variance);
-        
+
         // Verify all acquires completed
         assert_eq!(total_acquires, num_tasks * acquires_per_task);
-        
+
         // Effective rate should be close to refill rate (with some overhead)
-        assert!(effective_rate > 50.0, "Effective rate too low: {:.2}", effective_rate);
-        assert!(effective_rate < 150.0, "Effective rate too high: {:.2}", effective_rate);
-        
+        assert!(
+            effective_rate > 50.0,
+            "Effective rate too low: {:.2}",
+            effective_rate
+        );
+        assert!(
+            effective_rate < 150.0,
+            "Effective rate too high: {:.2}",
+            effective_rate
+        );
+
         println!("\n=== FastQuota Test Passed ===\n");
+    }
+
+    // ========================================================================
+    // Synchronous implementation tests
+    // ========================================================================
+
+    #[test]
+    fn test_quota_sync_basic() {
+        let quota = QuotaSync::new(100, 10, Duration::from_millis(100));
+
+        // Should acquire immediately since we start with capacity
+        let start = std::time::Instant::now();
+        quota.acquire(50);
+        let elapsed = start.elapsed();
+
+        // Should be very fast (no waiting)
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_quota_sync_rate_limiting() {
+        let quota = QuotaSync::new(10, 1, Duration::from_millis(100));
+
+        // Acquire all tokens
+        quota.acquire(10);
+
+        // Next acquire should wait for refill
+        let start = std::time::Instant::now();
+        quota.acquire(1);
+        let elapsed = start.elapsed();
+
+        // Should have waited for at least one refill
+        assert!(elapsed >= Duration::from_millis(90));
+    }
+
+    #[test]
+    fn test_quota_sync_concurrent() {
+        use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
+        use std::sync::Arc as StdArc;
+
+        let quota = QuotaSync::new(100, 10, Duration::from_millis(50));
+        let acquired_count = StdArc::new(StdAtomicUsize::new(0));
+
+        // Spawn 10 threads trying to acquire tokens
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let quota = quota.clone();
+            let count = acquired_count.clone();
+            handles.push(thread::spawn(move || {
+                quota.acquire(5);
+                count.fetch_add(1, StdOrdering::Relaxed);
+            }));
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All 10 should have acquired
+        assert_eq!(acquired_count.load(StdOrdering::Relaxed), 10);
+    }
+
+    #[test]
+    fn test_fast_quota_sync_basic() {
+        let quota = FastQuotaSync::new(100, 10, Duration::from_millis(100));
+
+        // Should acquire immediately since we start with capacity
+        let start = std::time::Instant::now();
+        quota.acquire(50);
+        let elapsed = start.elapsed();
+
+        // Should be very fast (no waiting)
+        assert!(elapsed < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_fast_quota_sync_rate_limiting() {
+        let quota = FastQuotaSync::new(10, 1, Duration::from_millis(100));
+
+        // Acquire all tokens
+        quota.acquire(10);
+
+        // Next acquire should wait for refill
+        let start = std::time::Instant::now();
+        quota.acquire(1);
+        let elapsed = start.elapsed();
+
+        // Should have waited for at least one refill
+        assert!(elapsed >= Duration::from_millis(90));
+    }
+
+    #[test]
+    fn test_fast_quota_sync_concurrent() {
+        use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
+        use std::sync::Arc as StdArc;
+
+        let quota = FastQuotaSync::new(100, 10, Duration::from_millis(50));
+        let acquired_count = StdArc::new(StdAtomicUsize::new(0));
+
+        // Spawn 10 threads trying to acquire tokens
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let quota = quota.clone();
+            let count = acquired_count.clone();
+            handles.push(thread::spawn(move || {
+                quota.acquire(5);
+                count.fetch_add(1, StdOrdering::Relaxed);
+            }));
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All 10 should have acquired
+        assert_eq!(acquired_count.load(StdOrdering::Relaxed), 10);
+    }
+
+    #[test]
+    fn test_fast_quota_sync_fast_path() {
+        use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as StdOrdering};
+        use std::sync::Arc as StdArc;
+
+        let quota = FastQuotaSync::new(1000, 100, Duration::from_millis(100));
+        let acquired_count = StdArc::new(StdAtomicUsize::new(0));
+
+        // With high capacity and low contention, most acquires should use fast path
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let quota = quota.clone();
+            let count = acquired_count.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..10 {
+                    quota.acquire(10);
+                    count.fetch_add(1, StdOrdering::Relaxed);
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All acquires should have completed
+        assert_eq!(acquired_count.load(StdOrdering::Relaxed), 50);
+    }
+
+    #[test]
+    #[should_panic(expected = "requested tokens 150 exceed max buffer size 100")]
+    fn test_quota_sync_panic_on_overflow() {
+        let quota = QuotaSync::new(100, 10, Duration::from_millis(100));
+        quota.acquire(150); // Should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "requested tokens 150 exceed max buffer size 100")]
+    fn test_fast_quota_sync_panic_on_overflow() {
+        let quota = FastQuotaSync::new(100, 10, Duration::from_millis(100));
+        quota.acquire(150); // Should panic
     }
 }
